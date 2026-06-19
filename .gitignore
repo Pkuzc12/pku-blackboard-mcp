@@ -1,0 +1,9 @@
+node_modules/
+
+# Local session, browser cache, temp (kept out of git — contains auth cookies)
+.cache/
+
+# Downloaded recordings (large, copyrighted)
+downloads/
+*.ts
+*.mp4
