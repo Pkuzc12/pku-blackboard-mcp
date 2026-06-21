@@ -1,146 +1,186 @@
-# pku-course-dl
+# pku-blackboard-mcp
 
 [English](README.md)
 
-下载北大教学网（`course.pku.edu.cn`）课堂实录 / 课程回放的 MCP 服务器。
+`pku-blackboard-mcp` 是一个用于北大教学网 Blackboard（`course.pku.edu.cn`）
+的 MCP 服务器。它可以帮助你列出并下载自己有权访问的课程回放、课堂实录
+以及 Blackboard 课程资料。
 
-参考 [pku-learner skill](https://github.com/pku-skills/curated/tree/main/skills/pku-learner)
-的「浏览器手动登录 → 抓取 m3u8 → HLS 下载」思路，做成一个**自包含、不污染系统环境**的 MCP：
+本项目是自包含的：
 
-- **不改系统环境变量**：所有配置由 MCP 客户端以进程级 env 传入，会话/缓存/下载全部放在项目目录内。
-- **不依赖系统 yt-dlp / ffmpeg**：用 Node 原生实现 HLS 下载 + AES-128 解密；封装 mp4 用 npm 包
-  `ffmpeg-static`（装在 `node_modules` 内）。
-- **优先复用系统浏览器**：登录优先用系统已装 Chrome → Edge，都没有才回退到项目内置 Chromium
-  （约 150MB，仅首次，下到项目 `.cache/browsers`，不写全局 `~/.cache`）。
+- 会话、缓存和默认下载目录都放在项目内。
+- 不依赖系统级 `yt-dlp` 或系统级 `ffmpeg`。
+- HLS/直连媒体下载由 Node.js 完成；HLS 封装 mp4 使用 npm 包 `ffmpeg-static`。
+- 登录和解析真实播放地址时优先复用系统 Chrome 或 Edge；必要时才使用项目内
+  Playwright Chromium。
 
-> 仅用于下载**你本人有权访问**的课程回放，请遵守学校规定与版权。
+> 仅用于访问和下载你本人有权限获取的课程内容。请遵守学校、课程、版权和传播规则。
 
 ## 环境要求
 
-- Node.js ≥ 20
-- 建议系统已装 Chrome 或 Edge；否则首次登录会按需下载项目内置 Chromium。
+- Node.js 20 或更新版本
+- 推荐安装 Chrome 或 Edge
+- 能访问 `course.pku.edu.cn` 及相关北大回放/资源域名
 
 ## 安装
 
 ```bash
-cd pku-course-dl
+cd pku-blackboard-mcp
 npm install
 ```
 
-`npm install` 不会下载浏览器。只有在既没有 Chrome 也没有 Edge 时，首次登录才会按需下载内置 Chromium。
+`npm install` 不会下载浏览器。只有在需要浏览器且找不到系统 Chrome/Edge 时，
+才会按需下载 Playwright Chromium 到项目缓存目录。
 
 ## 工具一览
 
-| 工具 | 作用 |
-|------|------|
-| `pku_status` | 查看登录状态、数据/下载目录位置（不开浏览器）。 |
-| `pku_login` | 打开浏览器，手动完成 IAAA 登录，自动保存会话。 |
-| `pku_list_lessons` | 列出某课程课堂实录里的**全部课次**（序号 + 标题），不播放、不下载。 |
-| `pku_download_lessons` | 传入挑好的课次**序号数组**，在一个窗口里依次抓取并后台批量下载。 |
-| `pku_capture_replay` | 打开浏览器，播放回放，抓取单个 m3u8 地址。 |
-| `pku_download` | 按 m3u8 后台下载 + AES-128 解密 + 封装 mp4，返回 jobId。 |
-| `pku_download_status` | 查询单个任务进度或列出全部任务。 |
+| 工具 | 用途 |
+| --- | --- |
+| `pku_status` | 检查保存的会话、cookie 数量和数据/下载路径。 |
+| `pku_login` | 打开浏览器完成 IAAA 登录并保存会话。 |
+| `pku_list_courses` | 不打开浏览器，列出你的 Blackboard 课程。 |
+| `pku_list_lessons` | 列出某课程的回放/课堂实录课次。 |
+| `pku_download_lessons` | 打开浏览器解析所选课次的真实媒体地址，并后台下载。 |
+| `pku_capture_replay` | 手动兜底：抓取单节回放媒体地址。 |
+| `pku_download` | 直接下载一个明确的 m3u8 地址。 |
+| `pku_download_status` | 查询回放或资料下载任务状态。 |
+| `pku_list_materials` | 列出 Blackboard 菜单栏目中的附件和可见文本。 |
+| `pku_download_materials` | 下载课程附件，并可把文本保存为 Markdown。 |
 
-## 典型流程（按课程批量下载，推荐）
+## 回放下载流程
 
-一门课往往有很多节课，推荐先看列表、挑序号、再批量下载：
+1. 运行 `pku_login`。
 
-1. **`pku_login`** — 弹出浏览器，用账号 / 微信 / 双因子完成 IAAA 登录。回到
-   `course.pku.edu.cn` 后会话自动保存到 `.cache/session-state.json`。
-2. **`pku_list_lessons`** — 弹出浏览器（复用会话），自动导航 `课程列表 → 点进课程 → 课堂实录`，
-   **停在课次列表**，返回全部课次：
+   浏览器会打开 `course.pku.edu.cn`。完成 IAAA 登录后，服务会把会话保存到
+   `.cache/session-state.json`。
+
+2. 运行 `pku_list_courses`，或直接运行 `pku_list_lessons`。
+
    ```json
-   { "ok": true, "count": 12, "lessons": [
-     { "index": 1, "title": "第1讲 …" },
-     { "index": 2, "title": "第2讲 …" }
-   ] }
+   {
+     "course": "量子多体理论"
+   }
    ```
-   - 传 `course`（课程名）或设环境变量 `PKU_COURSE_NAME`，从首页自动点进目标课。课程名是**模糊匹配**
-     （先子串、再按顺序匹配），漏字或小笔误也能命中最贴近的那门课。
-   - 传 `url` 可直接打开课堂实录列表页，跳过导航。
-   - 没找到列表时返回里带 `diagnostics`（当前页面真实的链接/按钮快照），便于定位选择器。
-3. **挑序号** — 从列表里确认想要哪几节，比如第 1、3、5 讲。
-4. **`pku_download_lessons`** — 传 `indices: [1, 3, 5]`（建议 `course`/`url` 与上一步一致）。在
-   **一个窗口**里依次播放每节、抓到各自的 m3u8 后**立即起后台下载任务**，返回每节的 `jobId`：
+
+   `pku_list_lessons` 通常通过已保存 cookie 直接 HTTP 解析，不打开浏览器。
+   返回结果包含课次序号、标题、录制时间，以及可用时的内部播放页地址。
+
+3. 选择课次序号，运行 `pku_download_lessons`。
+
    ```json
-   { "ok": true, "results": [
-     { "index": 1, "jobId": "job-1", "name": "course-01", "m3u8": "https://…" },
-     { "index": 3, "jobId": "job-2", "name": "course-03", "m3u8": "https://…" }
-   ], "skipped": [] }
+   {
+     "course": "量子多体理论",
+     "indices": [1],
+     "namePrefix": "量子多体理论-2024-12-27"
+   }
    ```
-   - 抓不到某节会进 `skipped`（带原因），其余照常下载。
-   - 输出文件名形如 `<前缀>-03.mp4`，可用 `namePrefix` 自定义前缀。
-5. **`pku_download_status`** — 不传参数列出全部任务，或传 `jobId` 看单个进度。返回里有进度条、速度、剩余时间：
-   `[██████████░░░░░░░░░░░░] 46%  120/260 segs  248.6MB  3.1MB/s  ETA 0:48`
-   完成后 `outFile` 即 mp4 路径（默认在 `downloads/`）。下载过程中还会通过 MCP 日志通知实时推送进度。
 
-> 一节课的回放可能上 GB、下载耗时数分钟，所以下载是后台任务，不会卡住对话。
+   这一步会打开一个浏览器窗口，这是正常现象：Blackboard 只有在回放 SSO/播放器
+   前端逻辑运行后，才会暴露真实媒体地址。解析完成后，服务会为 HLS（m3u8）
+   或直连 MP4 启动后台下载任务。
 
-## 只下单节（备用流程）
+4. 运行 `pku_download_status` 查询进度。
 
-只想抓某一个回放、或自动导航没生效时：
+   ```json
+   {
+     "jobId": "job-1"
+   }
+   ```
 
-1. **`pku_capture_replay`** — 弹出浏览器（复用会话），**默认自动播放**，监听抓取 `playlist.m3u8`。
-   窗口有头，可手动点击兜底，或传 `autoplay: false`。注意它**只会抓列表里的第一节** —— 要选具体哪节
-   请用 `pku_list_lessons` + `pku_download_lessons`。
-2. **`pku_download`** — 把拿到的 `m3u8` 传进来（建议给 `name`），返回 `jobId`。
-3. **`pku_download_status`** — 传 `jobId` 查看进度。
+   完成后的结果会包含 `outFile`。
 
-## 配置（可选，全部为进程级 env，不写系统）
+## 课程资料流程
 
-| 环境变量 | 默认 | 说明 |
-|----------|------|------|
-| `PKU_DATA_DIR` | `<项目>/.cache` | 会话、浏览器缓存、临时文件 |
-| `PKU_DOWNLOAD_DIR` | `<项目>/downloads` | 视频输出目录 |
-| `PKU_CONCURRENCY` | `6` | HLS 分片并发数 |
-| `PKU_COURSE_HOME` | `https://course.pku.edu.cn` | 教学网首页 |
-| `PKU_COURSE_NAME` | （空） | 课程名，用于自动导航（也可在工具里传 `course`） |
-| `PLAYWRIGHT_BROWSERS_PATH` | `<PKU_DATA_DIR>/browsers` | 内置 Chromium 缓存位置（默认指向项目内） |
+1. 运行 `pku_list_materials`。
 
-## 接入 MCP 客户端
+   ```json
+   {
+     "course": "量子多体理论",
+     "types": ["content", "announcements", "grades", "staff"]
+   }
+   ```
 
-把 `/path/to/pku-course-dl` 换成你的实际项目路径（Windows 用正斜杠或双反斜杠）。
+   返回内容包括：
 
-### Claude Code
+   - `files`：可下载的 Blackboard 附件，通常是 `bbcswebdav` URL
+   - `texts`：公告、成绩、教师信息等可见文本摘要
+   - `sections`：每个菜单栏目的提取详情
 
-```bash
-claude mcp add pku-course-dl -- node "/path/to/pku-course-dl/src/index.js"
+2. 运行 `pku_download_materials`。
+
+   ```json
+   {
+     "course": "量子多体理论",
+     "fileUrls": ["https://course.pku.edu.cn/bbcswebdav/..."],
+     "saveText": "md"
+   }
+   ```
+
+   不传 `fileUrls` 时，会下载匹配范围内的全部附件。设置
+   `downloadFiles: false` 且 `saveText: "md"` 时，可以只保存文本。
+
+## 配置
+
+所有配置都由 MCP 客户端以进程级环境变量传入。
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `PKU_DATA_DIR` | `<project>/.cache` | 会话、浏览器缓存和临时数据。 |
+| `PKU_DOWNLOAD_DIR` | `<project>/downloads` | 默认下载目录。 |
+| `PKU_CONCURRENCY` | `6` | HLS 分片下载并发数。 |
+| `PKU_COURSE_HOME` | `https://course.pku.edu.cn` | Blackboard 入口。 |
+| `PKU_COURSE_NAME` | 空 | 工具默认课程名。 |
+| `PLAYWRIGHT_BROWSERS_PATH` | `<PKU_DATA_DIR>/browsers` | 项目内 Playwright 浏览器缓存目录。 |
+
+输出目录优先级：
+
+```text
+工具参数 outDir
+> PKU_DOWNLOAD_DIR
+> <project>/downloads
 ```
 
-如需传入配置（见[配置](#配置可选全部为进程级-env不写系统)），在 `--` 分隔符**之前**
-加一个或多个 `-e KEY=value`：
+## 接入 Claude Code
+
+把 `/path/to/pku-blackboard-mcp` 替换为你的本地项目路径。
 
 ```bash
-claude mcp add pku-course-dl \
-  -e PKU_COURSE_NAME="实验原子物理进展" \
+claude mcp add pku-blackboard-mcp -- node "/path/to/pku-blackboard-mcp/src/index.js"
+```
+
+带环境变量：
+
+```bash
+claude mcp add pku-blackboard-mcp \
   -e PKU_DOWNLOAD_DIR="/path/to/downloads" \
-  -- node "/path/to/pku-course-dl/src/index.js"
+  -e PKU_COURSE_NAME="量子多体理论" \
+  -- node "/path/to/pku-blackboard-mcp/src/index.js"
 ```
 
-默认以 `local` 作用域添加（仅当前项目）。用 `-s user` 对所有项目生效，或用 `-s project`
-通过提交 `.mcp.json` 共享给团队。
+### Windows PowerShell
 
-> **Windows / PowerShell：** `claude mcp add … -- node …` 这种写法会失败——PowerShell 吞掉
-> `--` 分隔符，导致变长选项 `-e` 把 `node` 和脚本路径一起当成环境变量值
-> （报 `error: missing required argument 'commandOrUrl'`）。改用 `add-json`；但 PowerShell
-> 在把 JSON 字符串传给原生程序时还会剥掉内部的双引号，所以必须把每个内部的 `"` 转义成
-> `\"`（外层仍用单引号）。路径用正斜杠可省去反斜杠转义：
->
-> ```powershell
-> claude mcp add-json pku-course-dl '{\"command\":\"node\",\"args\":[\"D:/path/to/pku-course-dl/src/index.js\"],\"env\":{\"PKU_DOWNLOAD_DIR\":\"D:/path/to/downloads\"}}'
-> ```
->
-> 修改已存在的配置需先删除（`add-json` 不会覆盖）：先 `claude mcp remove pku-course-dl`，
-> 再重跑上面的命令。用 `claude mcp get pku-course-dl` 核对。
+PowerShell 可能会错误处理 `--` 分隔符和 JSON 引号。通常 `add-json` 更可靠：
 
-### 通用 stdio 配置
+```powershell
+claude mcp add-json pku-blackboard-mcp '{\"command\":\"node\",\"args\":[\"D:/path/to/pku-blackboard-mcp/src/index.js\"],\"env\":{\"PKU_DOWNLOAD_DIR\":\"D:/path/to/downloads\"}}'
+```
+
+更新已有配置：
+
+```powershell
+claude mcp remove pku-blackboard-mcp
+claude mcp add-json pku-blackboard-mcp '{\"command\":\"node\",\"args\":[\"D:/path/to/pku-blackboard-mcp/src/index.js\"]}'
+claude mcp get pku-blackboard-mcp
+```
+
+## 通用 MCP 配置
 
 ```json
 {
   "mcpServers": {
-    "pku-course-dl": {
+    "pku-blackboard-mcp": {
       "command": "node",
-      "args": ["/path/to/pku-course-dl/src/index.js"],
+      "args": ["/path/to/pku-blackboard-mcp/src/index.js"],
       "env": {
         "PKU_DOWNLOAD_DIR": "/path/to/downloads"
       }
@@ -149,9 +189,21 @@ claude mcp add pku-course-dl \
 }
 ```
 
+## 测试
+
+```bash
+npm test
+node --check src/index.js
+node --check src/capture.js
+node --check src/jobs.js
+node --check src/materials.js
+```
+
+完整离线和 live 测试清单见 [TESTING.md](TESTING.md)。
+
 ## 说明与限制
 
-- 仅用于下载**你本人有权访问**的课程回放，请遵守学校规定与版权。
-- 会话 cookie 通常几小时～几天过期；过期后工具会提示重新 `pku_login`。
-- 目前支持标准 HLS（含 AES-128）。若某课程用 polyv / 超星 / ClassIn 等非 HLS 平台，可能抓不到 m3u8，需另行适配。
-- `.cache/` 含登录 cookie，已在 `.gitignore` 中，不要提交或外传。
+- 下载回放时可能会打开浏览器，用于解析 SSO/播放器中的真实媒体地址。
+- 有些回放暴露的是直连 MP4，而不是 HLS；`pku_download_lessons` 已支持两者。
+- `pku_download` 只用于明确的 m3u8 URL；课程课次下载请使用 `pku_download_lessons`。
+- `.cache/` 含登录 cookie，不要提交或分享。

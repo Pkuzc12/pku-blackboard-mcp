@@ -1,162 +1,190 @@
-# pku-course-dl
+# pku-blackboard-mcp
 
 [中文文档](README.zh.md)
 
-An MCP server for downloading lecture recordings / replays (课堂实录 / 课程回放) from
-PKU's teaching network (`course.pku.edu.cn`).
+`pku-blackboard-mcp` is an MCP server for PKU Blackboard (`course.pku.edu.cn`).
+It helps you list and download course recordings, replay videos, and Blackboard
+course materials that your account is authorized to access.
 
-Inspired by the [pku-learner skill](https://github.com/pku-skills/curated/tree/main/skills/pku-learner)
-(manual browser login → sniff m3u8 → HLS download), but packaged as a **self-contained MCP that
-never touches your system environment**:
+The server is self-contained:
 
-- **No global env changes** — all config is passed as process-scoped env from the MCP client;
-  session, cache, and downloads all stay inside the project directory.
-- **No system yt-dlp / ffmpeg** — HLS download + AES-128 decryption are implemented in pure Node;
-  remuxing to mp4 uses the `ffmpeg-static` npm package (lives in `node_modules`).
-- **Reuses your browser** — login prefers a system-installed Chrome → Edge, falling back to a
-  project-local Chromium (≈150 MB, first run only, downloaded into the project's `.cache/browsers`,
-  never to the global `~/.cache`).
+- It stores session state, cache, and default downloads inside the project.
+- It does not require system `yt-dlp` or system `ffmpeg`.
+- It uses Node.js for HLS/direct-media downloads; HLS remuxing uses the npm
+  package `ffmpeg-static`.
+- It reuses a system Chrome or Edge for login and media URL resolution, falling
+  back to project-local Playwright Chromium only when needed.
 
-> For downloading recordings **you are authorized to access** only. Respect your institution's
-> rules and copyright.
+> Use this only for courses and files you are authorized to access. Follow PKU,
+> course, copyright, and redistribution rules.
 
 ## Requirements
 
-- Node.js ≥ 20
-- A system Chrome or Edge (recommended), otherwise a project-local Chromium is fetched on first login.
+- Node.js 20 or newer
+- Chrome or Edge recommended
+- Network access to `course.pku.edu.cn` and related PKU replay/resource domains
 
 ## Install
 
 ```bash
-cd pku-course-dl
+cd pku-blackboard-mcp
 npm install
 ```
 
-`npm install` does not download a browser. A bundled Chromium is fetched only on first login, and
-only if neither Chrome nor Edge is found.
+`npm install` does not download a browser. Playwright Chromium is downloaded
+only if no usable system Chrome/Edge is available when a browser is needed.
 
-## Tools
+## Capabilities
 
 | Tool | Purpose |
-|------|---------|
-| `pku_status` | Show login state and data/download dir locations (no browser). |
-| `pku_login` | Open a browser to complete IAAA login; saves the session. |
-| `pku_list_lessons` | List **all lessons** (index + title) in a course's recordings — no playback, no download. |
-| `pku_download_lessons` | Take an array of lesson indices; capture and background-download them in one window. |
-| `pku_capture_replay` | Open a browser, play a replay, and sniff a single m3u8 URL. |
-| `pku_download` | Background download + AES-128 decrypt + remux to mp4 for one m3u8; returns a jobId. |
-| `pku_download_status` | Query a job's progress, or list all jobs. |
+| --- | --- |
+| `pku_status` | Check saved session, cookie count, and data/download paths. |
+| `pku_login` | Open a browser for manual IAAA login and save the session. |
+| `pku_list_courses` | List your Blackboard courses without opening a browser. |
+| `pku_list_lessons` | List recording/replay lessons for a course. |
+| `pku_download_lessons` | Resolve selected lesson media URLs in a browser, then download in background. |
+| `pku_capture_replay` | Manual fallback for capturing one replay media URL. |
+| `pku_download` | Download one explicit m3u8 URL as a background job. |
+| `pku_download_status` | Query background recording/material download jobs. |
+| `pku_list_materials` | List course attachments and visible text from Blackboard menu tabs. |
+| `pku_download_materials` | Download selected course attachments and optionally save text as Markdown. |
 
-## Typical flow (batch download, recommended)
+## Recording Workflow
 
-A course usually has many lessons, so list first, pick indices, then download:
+1. Run `pku_login`.
 
-1. **`pku_login`** — a browser window opens; complete IAAA login (password / WeChat / 2FA). The
-   session is saved to `.cache/session-state.json` once you return to `course.pku.edu.cn`.
-2. **`pku_list_lessons`** — opens a browser (reusing the session), auto-navigates
-   `course list → course → recordings`, stops at the lesson list, and returns every lesson:
+   A browser opens at `course.pku.edu.cn`. Complete IAAA login. The server saves
+   the session to `.cache/session-state.json` after Blackboard is reached.
+
+2. Run `pku_list_courses` or directly run `pku_list_lessons`.
+
    ```json
-   { "ok": true, "count": 12, "lessons": [
-     { "index": 1, "title": "Lesson 1 …" },
-     { "index": 2, "title": "Lesson 2 …" }
-   ] }
+   {
+     "course": "量子多体理论"
+   }
    ```
-   - Pass `course` (course name) or set `PKU_COURSE_NAME` to auto-open the course from the home
-     page. The name is **fuzzy-matched** (substring first, then subsequence), so minor typos or a
-     missing character still resolve to the closest course.
-   - Pass `url` to open the recordings list directly and skip navigation.
-   - If the list isn't found, the result includes `diagnostics` (a snapshot of the page's real
-     links/buttons) to help pin selectors.
-3. **Pick indices** — choose the lessons you want, e.g. 1, 3, 5.
-4. **`pku_download_lessons`** — pass `indices: [1, 3, 5]` (use the same `course`/`url` as step 2).
-   In a single window it plays each lesson, captures its m3u8, and starts a background job per
-   lesson, returning each `jobId`:
+
+   `pku_list_lessons` usually replays saved cookies over HTTP and does not open a
+   browser. It returns lesson indices, titles, record times, and internal player
+   URLs when available.
+
+3. Pick lesson indices and run `pku_download_lessons`.
+
    ```json
-   { "ok": true, "results": [
-     { "index": 1, "jobId": "job-1", "name": "course-01", "m3u8": "https://…" },
-     { "index": 3, "jobId": "job-2", "name": "course-03", "m3u8": "https://…" }
-   ], "skipped": [] }
+   {
+     "course": "量子多体理论",
+     "indices": [1],
+     "namePrefix": "quantum-many-body-2024-12-27"
+   }
    ```
-   - Lessons whose m3u8 can't be captured go to `skipped` (with a reason); the rest proceed.
-   - Output files are named `<prefix>-03.mp4`; customize via `namePrefix`.
-5. **`pku_download_status`** — list all jobs, or pass a `jobId` for one. Progress includes a bar,
-   speed, and ETA, e.g.:
-   `[██████████░░░░░░░░░░░░] 46%  120/260 segs  248.6MB  3.1MB/s  ETA 0:48`
-   The output `mp4` path is in `outFile` (default `downloads/`). Progress is also pushed live via
-   MCP logging notifications.
 
-> A single replay can be 1–2 GB and take minutes, so downloads run in the background and never
-> block the conversation.
+   This step opens one browser window. That is expected: Blackboard only exposes
+   the real media URL after its replay SSO/player logic runs. The server then
+   starts background downloads for either HLS (`m3u8`) or direct MP4 media.
 
-## Single lesson (fallback)
+4. Run `pku_download_status`.
 
-When you only want one replay, or auto-navigation doesn't kick in:
+   ```json
+   {
+     "jobId": "job-1"
+   }
+   ```
 
-1. **`pku_capture_replay`** — opens a browser (reusing the session), **auto-plays by default**, and
-   sniffs the `playlist.m3u8`. The window is headed, so you can click manually as a fallback (or
-   pass `autoplay: false`). Note it captures **only the first lesson** in the list — for a specific
-   lesson use `pku_list_lessons` + `pku_download_lessons`.
-2. **`pku_download`** — pass the captured `m3u8` (and ideally a `name`); returns a `jobId`.
-3. **`pku_download_status`** — pass the `jobId` to track progress.
+   Completed jobs include `outFile`.
 
-## Configuration (optional, all process-scoped env)
+## Materials Workflow
+
+1. Run `pku_list_materials`.
+
+   ```json
+   {
+     "course": "量子多体理论",
+     "types": ["content", "announcements", "grades", "staff"]
+   }
+   ```
+
+   The result contains:
+
+   - `files`: downloadable Blackboard attachments, usually `bbcswebdav` URLs
+   - `texts`: visible text snippets such as announcements, grades, and staff info
+   - `sections`: per-menu-tab extraction details
+
+2. Run `pku_download_materials`.
+
+   ```json
+   {
+     "course": "量子多体理论",
+     "fileUrls": ["https://course.pku.edu.cn/bbcswebdav/..."],
+     "saveText": "md"
+   }
+   ```
+
+   Omit `fileUrls` to download all matched files. Set `downloadFiles: false` and
+   `saveText: "md"` to save text only.
+
+## Configuration
+
+All configuration is process-scoped environment passed by your MCP client.
 
 | Env var | Default | Description |
-|---------|---------|-------------|
-| `PKU_DATA_DIR` | `<project>/.cache` | Session, browser cache, temp files. |
-| `PKU_DOWNLOAD_DIR` | `<project>/downloads` | Video output directory. |
+| --- | --- | --- |
+| `PKU_DATA_DIR` | `<project>/.cache` | Session state, browser cache, temp data. |
+| `PKU_DOWNLOAD_DIR` | `<project>/downloads` | Default output directory. |
 | `PKU_CONCURRENCY` | `6` | HLS segment download concurrency. |
-| `PKU_COURSE_HOME` | `https://course.pku.edu.cn` | Teaching network entry point. |
-| `PKU_COURSE_NAME` | (empty) | Course name for auto-navigation (also settable per call via `course`). |
-| `PLAYWRIGHT_BROWSERS_PATH` | `<PKU_DATA_DIR>/browsers` | Bundled Chromium location (defaults inside the project). |
+| `PKU_COURSE_HOME` | `https://course.pku.edu.cn` | Blackboard entry point. |
+| `PKU_COURSE_NAME` | empty | Default course name for tools that accept `course`. |
+| `PLAYWRIGHT_BROWSERS_PATH` | `<PKU_DATA_DIR>/browsers` | Project-local Playwright browser cache. |
 
-## Connecting an MCP client
+Output directory priority:
 
-Replace `/path/to/pku-course-dl` with your actual project path (on Windows, use forward slashes or
-double backslashes).
-
-### Claude Code
-
-```bash
-claude mcp add pku-course-dl -- node "/path/to/pku-course-dl/src/index.js"
+```text
+tool argument outDir
+> PKU_DOWNLOAD_DIR
+> <project>/downloads
 ```
 
-To pass configuration (see [Configuration](#configuration-optional-all-process-scoped-env)),
-add one or more `-e KEY=value` flags **before** the `--` separator:
+## Connect to Claude Code
+
+Replace `/path/to/pku-blackboard-mcp` with your local project path.
 
 ```bash
-claude mcp add pku-course-dl \
-  -e PKU_COURSE_NAME="实验原子物理进展" \
+claude mcp add pku-blackboard-mcp -- node "/path/to/pku-blackboard-mcp/src/index.js"
+```
+
+With environment variables:
+
+```bash
+claude mcp add pku-blackboard-mcp \
   -e PKU_DOWNLOAD_DIR="/path/to/downloads" \
-  -- node "/path/to/pku-course-dl/src/index.js"
+  -e PKU_COURSE_NAME="量子多体理论" \
+  -- node "/path/to/pku-blackboard-mcp/src/index.js"
 ```
 
-By default the server is added at `local` scope (this project only). Use `-s user` for all
-projects, or `-s project` to share it via a committed `.mcp.json`.
+### Windows PowerShell
 
-> **Windows / PowerShell:** the `claude mcp add … -- node …` form fails because PowerShell drops
-> the `--` separator, so the variadic `-e` swallows `node` and the script path
-> (`error: missing required argument 'commandOrUrl'`). Use `add-json` instead — but PowerShell also
-> strips the inner double quotes when passing a JSON string to a native command, so you must escape
-> each interior `"` as `\"` (outer quotes stay single). Use forward slashes in paths to avoid
-> backslash escaping:
->
-> ```powershell
-> claude mcp add-json pku-course-dl '{\"command\":\"node\",\"args\":[\"D:/path/to/pku-course-dl/src/index.js\"],\"env\":{\"PKU_DOWNLOAD_DIR\":\"D:/path/to/downloads\"}}'
-> ```
->
-> To change an existing entry, remove it first (`add-json` won't overwrite):
-> `claude mcp remove pku-course-dl` then re-run the command above. Verify with
-> `claude mcp get pku-course-dl`.
+PowerShell may mishandle the `--` separator and JSON quoting for native
+commands. `add-json` is often more reliable:
 
-### Generic stdio config
+```powershell
+claude mcp add-json pku-blackboard-mcp '{\"command\":\"node\",\"args\":[\"D:/path/to/pku-blackboard-mcp/src/index.js\"],\"env\":{\"PKU_DOWNLOAD_DIR\":\"D:/path/to/downloads\"}}'
+```
+
+To update an existing entry:
+
+```powershell
+claude mcp remove pku-blackboard-mcp
+claude mcp add-json pku-blackboard-mcp '{\"command\":\"node\",\"args\":[\"D:/path/to/pku-blackboard-mcp/src/index.js\"]}'
+claude mcp get pku-blackboard-mcp
+```
+
+## Generic MCP Config
 
 ```json
 {
   "mcpServers": {
-    "pku-course-dl": {
+    "pku-blackboard-mcp": {
       "command": "node",
-      "args": ["/path/to/pku-course-dl/src/index.js"],
+      "args": ["/path/to/pku-blackboard-mcp/src/index.js"],
       "env": {
         "PKU_DOWNLOAD_DIR": "/path/to/downloads"
       }
@@ -165,11 +193,23 @@ projects, or `-s project` to share it via a committed `.mcp.json`.
 }
 ```
 
-## Notes and limitations
+## Testing
 
-- Use only for recordings **you are authorized to access**; respect institutional rules and copyright.
-- Session cookies usually expire within hours to days; once expired, the tools prompt you to
-  `pku_login` again.
-- Supports standard HLS (including AES-128). Non-HLS platforms (polyv / 超星 / ClassIn / …) may not
-  yield an m3u8 and would need separate handling.
-- `.cache/` holds login cookies, is gitignored, and must not be committed or shared.
+```bash
+npm test
+node --check src/index.js
+node --check src/capture.js
+node --check src/jobs.js
+node --check src/materials.js
+```
+
+See [TESTING.md](TESTING.md) for the full offline and live testing checklist.
+
+## Notes and Limitations
+
+- Recording downloads may open a browser to resolve SSO/player media URLs.
+- Some recordings expose direct MP4 media instead of HLS; both are supported by
+  `pku_download_lessons`.
+- `pku_download` is for explicit m3u8 URLs only; use `pku_download_lessons` for
+  course lessons.
+- `.cache/` contains login cookies and must not be committed or shared.

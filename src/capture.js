@@ -12,8 +12,9 @@ import {
   ensureDirs,
   applyBrowsersPath,
 } from "./config.js";
-import { hasSession } from "./session.js";
-import { startDownload } from "./jobs.js";
+import { hasSession, checkSessionValid } from "./session.js";
+import { httpGet, listLessonsHttp, listCoursesHttp } from "./portal.js";
+import { startDirectDownload, startDownload } from "./jobs.js";
 
 applyBrowsersPath();
 
@@ -35,9 +36,9 @@ function isLoginHost(u) {
   return IAAA_HOSTS.some((h) => hostOf(u).endsWith(h));
 }
 
-async function newContext(browser) {
+async function newContext(browser, { fresh = false } = {}) {
   return browser.newContext({
-    storageState: hasSession() ? STATE_FILE : undefined,
+    storageState: !fresh && hasSession() ? STATE_FILE : undefined,
     ignoreHTTPSErrors: true,
     viewport: null,
     userAgent: undefined,
@@ -396,17 +397,36 @@ async function dumpPage(page) {
 // persist the session. Returns a summary object.
 export async function runLogin({ timeoutMs = 300000 } = {}) {
   ensureDirs();
-  // If we already have a saved session, landing on the course host counts as
-  // logged in immediately. For a fresh login we first expect a bounce to the
-  // IAAA portal, so we only accept "course host" once we've seen that bounce —
-  // this avoids a false positive on the initial pre-redirect page load.
-  const startedWithSession = hasSession();
+  // Decide up front whether we're "topping up" a working session or doing a
+  // fresh login — and crucially, verify the saved session actually WORKS, not
+  // just that a state file exists. course.pku.edu.cn's root is a public 200
+  // landing page, so a stale state file would otherwise make us land on the
+  // course host, declare success instantly, and close the window before the
+  // user can log in. Only an actually-valid session lets us accept "on course
+  // host" immediately; for an expired/absent one we require seeing the IAAA
+  // bounce first, exactly like a brand-new login.
+  const check = await checkSessionValid().catch(() => ({ valid: null }));
+  const startedWithSession = check.valid === true;
   const { browser, engine } = await launchBrowser({ headless: false });
   try {
-    const context = await newContext(browser);
+    // Start from a clean context unless the saved session is actually valid:
+    // loading stale cookies can leave the site half-logged-in and get in the
+    // way of a fresh IAAA login.
+    const context = await newContext(browser, { fresh: !startedWithSession });
     const page = await context.newPage();
-    await page.goto(COURSE_HOME, { waitUntil: "domcontentloaded" }).catch(() => {});
-
+    // For a fresh/expired login, open an *authenticated* endpoint rather than
+    // the public root: course.pku.edu.cn/ is a 200 landing page that won't
+    // bounce an unauthenticated visitor, so the user would have to find the
+    // login link themselves. The portal tab endpoint 302s straight to IAAA when
+    // there's no valid session, landing the window right on the login form. A
+    // valid session just renders the portal, which is fine too.
+    const entry = startedWithSession
+      ? COURSE_HOME
+      : new URL(
+          "/webapps/portal/execute/tabs/tabAction?tab_tab_group_id=_1_1",
+          COURSE_HOME
+        ).href;
+    await page.goto(entry, { waitUntil: "domcontentloaded" }).catch(() => {});
     const deadline = Date.now() + timeoutMs;
     let loggedIn = false;
     let sawLogin = startedWithSession;
@@ -556,11 +576,119 @@ export async function captureReplay({
   }
 }
 
-// Open a headed window (reusing the session), navigate to the course's
-// recordings list WITHOUT playing anything, and return every lesson as
-// { index (1-based), title }. The user picks indices from this, then passes
-// them to downloadLessons.
+// List the user's courses, browser-free. Answers "what courses do I have" so
+// the model never has to open a window just to enumerate courses.
+export async function listCourses() {
+  ensureDirs();
+  if (!hasSession()) {
+    return { ok: false, message: "Not logged in. Run pku_login first. / 尚未登录。请先运行 pku_login。" };
+  }
+  const r = await listCoursesHttp().catch((e) => ({
+    ok: false,
+    reason: "http-error",
+    detail: String(e && e.message ? e.message : e),
+  }));
+  if (r.ok) {
+    return {
+      ok: true,
+      via: "http",
+      count: r.count,
+      courses: r.courses.map((c) => c.title),
+      message: `Found ${r.count} courses (no browser) / 找到 ${r.count} 门课（未开浏览器）. Pass a course name to pku_list_lessons. / 用课程名调用 pku_list_lessons 查看课次。`,
+    };
+  }
+  if (r.reason === "expired") {
+    return {
+      ok: false,
+      message:
+        "Session expired, redirected to IAAA login. Run pku_login again. / 会话已过期，被重定向到 IAAA 登录。请重新运行 pku_login。",
+    };
+  }
+  return {
+    ok: false,
+    reason: r.reason,
+    message: `Could not list courses (${r.reason}). / 无法列出课程（${r.reason}）。`,
+  };
+}
+
+// List a course's lessons. Tries the browser-free path first (replay saved
+// cookies, parse the server-rendered recordings list — no window), and only
+// falls back to opening a browser if HTTP parsing finds nothing (e.g. a course
+// on a non-standard player whose list page we can't parse). The user picks
+// indices from the result, then passes them to downloadLessons.
 export async function listLessons({ url, timeoutMs = 120000, course } = {}) {
+  ensureDirs();
+  if (!hasSession()) {
+    return { ok: false, message: "Not logged in. Run pku_login first. / 尚未登录。请先运行 pku_login。" };
+  }
+  const courseName = (course || COURSE_NAME || "").trim();
+
+  // Browser-free path.
+  const http = await listLessonsHttp({ course: courseName, url }).catch((e) => ({
+    ok: false,
+    reason: "http-error",
+    detail: String(e && e.message ? e.message : e),
+  }));
+
+  if (http.ok) {
+    return {
+      ok: true,
+      via: "http",
+      course: http.course,
+      listUrl: http.listUrl,
+      count: http.count,
+      lessons: http.lessons,
+      message: `Found ${http.count} lessons (no browser) / 找到 ${http.count} 节课（未开浏览器）. Pick indices and pass them to pku_download_lessons. / 确认序号后用 pku_download_lessons 传 indices 下载。`,
+    };
+  }
+
+  if (http.reason === "expired") {
+    return {
+      ok: false,
+      message:
+        "Session expired, redirected to IAAA login. Run pku_login again. / 会话已过期，被重定向到 IAAA 登录。请重新运行 pku_login。",
+    };
+  }
+
+  // We fetched the course list fine but no course matched the given name. The
+  // browser would see the exact same list and miss the same way, so don't open
+  // a window — return the real course list so the user can fix the name.
+  if (http.reason === "no-course") {
+    return {
+      ok: false,
+      reason: "no-course",
+      courses: http.courses || [],
+      message:
+        `No course matched "${courseName}". Your courses are listed in \`courses\` — pass an exact/closer name (fuzzy-matched) or a direct \`url\`. / 没有匹配到课程“${courseName}”。你的课程见 courses 字段，请改用更准确的课程名（支持模糊匹配）或直接传 url。`,
+    };
+  }
+
+  // No course name and no url to disambiguate. Don't open a browser to a generic
+  // home page and wait — list the courses so the user can pick one.
+  if (http.reason === "no-course-name" && !url) {
+    const courses = await listCourses();
+    if (courses.ok) {
+      return {
+        ok: false,
+        reason: "need-course",
+        courses: courses.courses,
+        message:
+          "Which course? Pick one from `courses` and pass it as `course`. / 想看哪门课？从 courses 里选一个，用 course 参数传入。",
+      };
+    }
+    return courses; // not-logged-in / expired / error — already a clean message
+  }
+
+  // Other failures (couldn't parse recordings/lessons, network, no course name)
+  // — fall back to the browser flow, which can handle courses whose recordings
+  // list we can't parse over plain HTTP, or let you navigate manually.
+  return listLessonsBrowser({ url, timeoutMs, course: courseName, httpReason: http.reason });
+}
+
+// Browser fallback: open a headed window (reusing the session), navigate to the
+// course's recordings list WITHOUT playing anything, and return every lesson as
+// { index (1-based), title }.
+async function listLessonsBrowser({ url, timeoutMs = 120000, course, httpReason } = {}) {
   ensureDirs();
   if (!hasSession()) {
     return { ok: false, message: "Not logged in. Run pku_login first. / 尚未登录。请先运行 pku_login。" };
@@ -632,10 +760,242 @@ function pickNewPlaylist(captured, seen) {
   return fresh.find((v) => /playlist|index|master/i.test(v.url)) || fresh[0];
 }
 
-// Open ONE headed window (reusing the session), navigate to the recordings list,
-// then for each chosen index: play that lesson, capture its m3u8, and kick off a
-// background download job. Returns the started jobs (track via pku_download_status).
+function pickNewMedia(captured, seen) {
+  const fresh = [...captured.values()].filter((v) => !seen.has(v.url));
+  if (fresh.length === 0) return null;
+  return fresh.find((v) => v.kind === "hls" && /playlist|index|master/i.test(v.url)) || fresh[0];
+}
+
+async function resolvePlayerUrl(playUrl) {
+  const page = await httpGet(playUrl).catch(() => null);
+  if (!page || page.status < 200 || page.status >= 300) return playUrl;
+  for (const m of page.body.matchAll(/<iframe[^>]+src="([^"]+)"/gi)) {
+    const u = new URL(m[1], page.url).href;
+    if (/yjapise\.pku\.edu\.cn|onlineroomse\.pku\.edu\.cn/i.test(u)) return u;
+  }
+  return playUrl;
+}
+
+async function collectVideoSources(page) {
+  const out = [];
+  for (const frame of page.frames()) {
+    const urls = await frame
+      .evaluate(() =>
+        Array.from(document.querySelectorAll("video"))
+          .map((v) => v.currentSrc || v.src || "")
+          .filter(Boolean)
+      )
+      .catch(() => []);
+    for (const url of urls) out.push({ url, referer: frame.url(), kind: /\.m3u8(\?|$)/i.test(url) ? "hls" : "direct" });
+  }
+  return out;
+}
+
+// Download chosen lessons. Like listLessons, we first resolve the lesson list
+// browser-free (replay saved cookies, parse the recordings page). That gives us
+// each lesson's direct player URL (playVideo.action?token=…), so the browser can
+// navigate STRAIGHT to a lesson instead of counting DOM links and clicking the
+// Nth "watch" anchor — no list-page restoration between lessons, no index drift.
+// We still need a headed browser for the player itself: resolving token -> m3u8
+// happens in client JS (SSO + stream lookup) that can't be replayed over HTTP.
+// If the HTTP list can't be parsed (non-standard player), we fall back to the
+// click-by-index browser flow, which can drive those pages by enumeration.
 export async function downloadLessons({
+  indices,
+  url,
+  timeoutMs = 180000,
+  course,
+  format = "mp4",
+  outDir,
+  namePrefix,
+} = {}) {
+  ensureDirs();
+  if (!hasSession()) {
+    return { ok: false, message: "Not logged in. Run pku_login first. / 尚未登录。请先运行 pku_login。" };
+  }
+  const wanted = [
+    ...new Set((indices || []).filter((n) => Number.isInteger(n) && n >= 1)),
+  ].sort((a, b) => a - b);
+  if (wanted.length === 0) {
+    return {
+      ok: false,
+      message:
+        "Pass `indices` (array of 1-based integers) for the lessons to download; use pku_list_lessons first to see them. / 请用 indices 传入要下载的课次序号（1 起的整数数组）。可先用 pku_list_lessons 查看序号。",
+    };
+  }
+  const courseName = (course || COURSE_NAME || "").trim();
+  const prefix = (namePrefix || courseName || "lesson").trim();
+
+  // Browser-free list -> per-lesson playUrl. On success, navigate straight to it.
+  const http = await listLessonsHttp({ course: courseName, url }).catch((e) => ({
+    ok: false,
+    reason: "http-error",
+    detail: String(e && e.message ? e.message : e),
+  }));
+  if (http.reason === "expired") {
+    return {
+      ok: false,
+      message:
+        "Session expired, redirected to IAAA login. Run pku_login again. / 会话已过期，被重定向到 IAAA 登录。请重新运行 pku_login。",
+    };
+  }
+  if (http.ok && http.lessons.some((l) => l.playUrl)) {
+    return downloadLessonsDirect({
+      lessons: http.lessons,
+      wanted,
+      prefix,
+      timeoutMs,
+      format,
+      outDir,
+    });
+  }
+
+  // Course list fetched but no match — the browser would miss the same way, so
+  // don't open a window; return the real list so the user can fix the name.
+  if (http.reason === "no-course") {
+    return {
+      ok: false,
+      reason: "no-course",
+      courses: http.courses || [],
+      message:
+        `No course matched "${courseName}". Your courses are listed in \`courses\` — pass an exact/closer name (fuzzy-matched) or a direct \`url\`. / 没有匹配到课程“${courseName}”。你的课程见 courses 字段，请改用更准确的课程名（支持模糊匹配）或直接传 url。`,
+    };
+  }
+
+  // Couldn't parse a direct list — fall back to the click-by-index browser flow.
+  return downloadLessonsBrowser({ indices: wanted, url, timeoutMs, course: courseName, format, outDir, namePrefix: prefix });
+}
+
+// Direct path: we already hold each lesson's player URL, so open ONE headed
+// window and page.goto() the chosen lesson's playUrl in turn, capturing its
+// m3u8. No DOM enumeration, no list restoration — each navigation is self-
+// contained, so lesson order can't drift and a player popup can't desync us.
+async function downloadLessonsDirect({ lessons, wanted, prefix, timeoutMs = 180000, format = "mp4", outDir } = {}) {
+  const { browser, engine } = await launchBrowser({ headless: false });
+  const captured = new Map(); // url -> { url, referer, kind }
+  try {
+    const context = await newContext(browser);
+    context.on("request", (req) => {
+      const u = req.url();
+      if ((/\.m3u8(\?|$)/i.test(u) || /\.mp4(\?|$)/i.test(u)) && !captured.has(u)) {
+        captured.set(u, {
+          url: u,
+          referer: req.headers()["referer"] || null,
+          kind: /\.m3u8(\?|$)/i.test(u) ? "hls" : "direct",
+        });
+      }
+    });
+    const page = await context.newPage();
+
+    const results = [];
+    const skipped = [];
+    for (const idx of wanted) {
+      const lesson = lessons[idx - 1];
+      if (!lesson || !lesson.playUrl) {
+        skipped.push({
+          index: idx,
+          reason: `out of range, ${lessons.length} total / 超出范围（共 ${lessons.length} 节）`,
+        });
+        continue;
+      }
+
+      const seen = new Set(captured.keys());
+      // Go straight to this lesson's real player page. Blackboard embeds the
+      // onlineroomse SSO/player inside an iframe; opening that SSO URL as the
+      // top-level page avoids intermittent iframe network failures and exposes
+      // direct mp4 sources for some older recordings.
+      const playerUrl = await resolvePlayerUrl(lesson.playUrl);
+      await page
+        .goto(playerUrl, { waitUntil: "domcontentloaded" })
+        .catch(() => {});
+      await sleep(2000);
+      if (isLoginHost(page.url())) {
+        await browser.close().catch(() => {});
+        return {
+          ok: false,
+          message:
+            "Session expired, redirected to IAAA login. Run pku_login again. / 会话已过期，被重定向到 IAAA 登录。请重新运行 pku_login。",
+        };
+      }
+
+      // Wait for THIS lesson's media URL, nudging playback each tick.
+      const perDeadline = Date.now() + timeoutMs;
+      let pick = null;
+      while (Date.now() < perDeadline) {
+        await pumpPlayVideos(page).catch(() => {});
+        for (const src of await collectVideoSources(page)) {
+          if (!captured.has(src.url)) captured.set(src.url, src);
+        }
+        pick = pickNewMedia(captured, seen);
+        if (pick) {
+          await sleep(1500); // brief grace for variant playlists to also appear
+          for (const src of await collectVideoSources(page)) {
+            if (!captured.has(src.url)) captured.set(src.url, src);
+          }
+          pick = pickNewMedia(captured, seen);
+          break;
+        }
+        await sleep(1200);
+      }
+
+      if (!pick) {
+        skipped.push({
+          index: idx,
+          reason: "timed out waiting for media URL / 超时未捕获到媒体地址",
+        });
+        continue;
+      }
+
+      const name = `${prefix}-${String(idx).padStart(2, "0")}`;
+      const job =
+        pick.kind === "hls"
+          ? startDownload({
+              m3u8: pick.url,
+              name,
+              referer: pick.referer || undefined,
+              outDir,
+              format,
+            })
+          : startDirectDownload({
+              url: pick.url,
+              name,
+              referer: pick.referer || page.url(),
+              outDir,
+            });
+      results.push({
+        index: idx,
+        title: lesson.title || null,
+        mediaUrl: pick.url,
+        mediaType: pick.kind,
+        jobId: job.id,
+        name: job.name,
+      });
+    }
+
+    await context.storageState({ path: STATE_FILE }).catch(() => {});
+    return {
+      ok: results.length > 0,
+      engine,
+      via: "http-direct",
+      results,
+      skipped,
+      message:
+        `Started background downloads for ${results.length} lesson(s) / 已对 ${results.length} 节课起后台下载任务` +
+        (skipped.length
+          ? `, skipped ${skipped.length} (see skipped) / ，跳过 ${skipped.length} 节（见 skipped）`
+          : "") +
+        ". Track progress with pku_download_status. / 。用 pku_download_status 查询进度。",
+    };
+  } finally {
+    await browser.close().catch(() => {});
+  }
+}
+
+// Browser fallback: open ONE headed window (reusing the session), navigate to the
+// recordings list, then for each chosen index: count to the Nth lesson link,
+// click it, capture its m3u8, and kick off a background download job. Used when
+// the browser-free list can't be parsed. Returns the started jobs.
+async function downloadLessonsBrowser({
   indices,
   url,
   timeoutMs = 180000,
